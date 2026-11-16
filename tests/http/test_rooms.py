@@ -1,5 +1,6 @@
 """Run: uv run --group dev python -m pytest tests"""
 
+import time
 from pathlib import Path
 
 import _client
@@ -50,12 +51,12 @@ def test_posting_to_the_events_room_documents_what_it_really_answers(client):
     """`/r/events` is the ordinary room POST handler with one room that always says no, so
     the body is read and parsed *before* the refusal — a malformed or oversized body never
     reaches the 403. Documenting only the 403 promised a client one outcome and delivered
-    three. Review catch on #40.
+    several. Review catch on #40; slow bodies can now time out before the refusal too.
     """
     import app as app_module
 
     documented = client.get("/openapi.json").json()["paths"]["/r/events"]["post"]
-    assert set(documented["responses"]) == {"400", "403", "413", "429"}
+    assert set(documented["responses"]) == {"400", "403", "408", "413", "429"}
     # It parses a body, so it declares one.
     assert (
         "text" in (documented["requestBody"]["content"]["application/json"]["schema"]["properties"])
@@ -88,25 +89,139 @@ def test_private_names_are_reachable_but_never_enumerated(client):
     assert "p-draft" not in client.get("/kv/plans").text
 
 
-def test_rooms_is_cached_but_never_stale_for_a_caller_that_just_wrote(client):
-    """The /rooms walk is cached; read-your-writes is what makes that safe.
+def test_rooms_cache_is_exact_about_structure_and_only_lags_on_recency(client, tmp_path):
+    """What the /rooms cache is allowed to be stale about, and what it never is.
 
     A time-only cache breaks the one thing the view is for: an agent creates a room, checks
-    /rooms, and does not find it. Writes therefore invalidate, and they do it in `take` —
-    the single point every write route already passes through — so a route added later
-    cannot forget to.
+    /rooms, and does not find it. `_rooms_stamp` is what stops that, and it stamps exactly
+    the structural counters — so a create, a topic and a reap are all still immediate, from
+    any worker, while message recency is left to the clock. The window is pinned far above
+    anything this test spends so that only the stamp can be the thing invalidating.
     """
+    import config
+    import store
+
+    with config.override(ROOMS_CACHE_SECONDS=60):
+        client.get("/r/first/say/bot/hi")
+        assert "first" in client.get("/rooms").text  # populates the cache
+
+        # A created room appears at once: the create bumps rooms_created, which is stamped.
+        client.get("/r/second/say/bot/hi")
+        assert "second" in client.get("/rooms").text, "a room created a moment ago must appear"
+
+        # So does a topic — it moves topics_written, which is stamped precisely because
+        # this is the one namespace the listing renders.
+        client.get("/kv/topic/first/set/what%20first%20is%20for")
+        assert "what first is for" in client.get("/rooms").text
+        before = client.get("/rooms?format=json").json()  # the walk the next reads reuse
+
+        # A message in an existing room moves it up the recency order and bumps its seq —
+        # and that, deliberately, is served stale. `messages` is one global lifetime
+        # counter, so stamping it made one message anywhere invalidate every listing and
+        # the cache never hit at all (see _rooms_stamp).
+        client.get("/r/first/say/bot/again")
+        view = client.get("/rooms?format=json").json()
+        by_name = {r["room"]: r for r in view["rooms"]}
+        assert by_name["first"]["last_seq"] == 1, "recency comes from the cache, not the walk"
+        # The byte figures come off the same stat as the recency, so they lag with it — the
+        # contract is what the walk measured, not a mix of fresh and stale fields.
+        was = {r["room"]: r for r in before["rooms"]}
+        assert by_name["first"]["bytes"] == was["first"]["bytes"]
+        assert view["bytes"] == before["bytes"]
+        assert view["total"] == before["total"], "`total` is structural, so it stays exact"
+
+        # A reap is structural again: the room is gone from the very next listing.
+        _age(store.room_path(tmp_path, "second"), store.IDLE_SECONDS + 60)
+        (tmp_path / ".reaped").unlink(missing_ok=True)  # the reaper is throttled; let it run
+        client.get("/r/first/say/bot/reap%20now")
+        assert "second" not in client.get("/rooms").text, "a reaped room must disappear at once"
+
+
+def test_a_note_outside_the_topic_namespace_does_not_age_out_the_rooms_walk(client):
+    """Only the namespace /rooms renders may invalidate the walk that renders it.
+
+    A topic is an ordinary note, so `notes_written` counts it — but it counts every other
+    note too, and the listing shows none of them. Stamping it meant a `did` or `kv` write
+    aged out the room walk: measured on technocore.chat 2026-08-26, 1,281 note writes a
+    minute of which 3 were topics, so /rooms walked all 10,240 rooms on essentially every
+    request even with `messages` already out of the stamp. `topics_written` is the same
+    signal narrowed to what is actually displayed.
+
+    Asserted through recency rather than a hit counter: a message is deliberately served
+    stale, so if the note that follows it invalidated the walk the *message* would appear.
+    The window is pinned far above anything this test spends, so only the stamp can be the
+    thing invalidating.
+    """
+    import config
+
+    with config.override(ROOMS_CACHE_SECONDS=60):
+        client.get("/r/first/say/bot/hi")
+        assert "first" in client.get("/rooms").text  # populates the cache
+
+        client.get("/r/first/say/bot/again")  # bumps last_seq to 2; must stay stale
+        client.get("/kv/did/0123456789abcdef/set/did%3Akey%3Az6MkTest")  # not a topic
+
+        view = client.get("/rooms?format=json").json()
+        by_name = {r["room"]: r for r in view["rooms"]}
+        assert by_name["first"]["last_seq"] == 1, (
+            "a did note invalidated the /rooms walk — the listing does not render that "
+            "namespace, so it must not be stamped"
+        )
+
+        # The converse still holds: the namespace that IS rendered invalidates at once.
+        client.get("/kv/topic/first/set/now%20it%20has%20a%20topic")
+        after = client.get("/rooms?format=json").json()
+        assert {r["room"]: r for r in after["rooms"]}["first"]["last_seq"] == 2
+        assert "now it has a topic" in client.get("/rooms").text
+
+
+def test_a_message_reaches_rooms_within_the_cache_window(client):
+    """The lag that dropping `messages` from the stamp introduces is bounded by
+    ROOMS_CACHE_SECONDS, and that bound is the contract now — not merely "eventually".
+
+    Paired with the assertion above that the same message is *not* visible before the
+    window elapses: together they say the clock is what releases it, and how long that is.
+    """
+    import config
+
     client.get("/r/first/say/bot/hi")
-    assert "first" in client.get("/rooms").text  # populates the cache
+    window = 0.25
+    with config.override(ROOMS_CACHE_SECONDS=window):
+        client.get("/rooms")  # populates the cache
+        client.get("/r/first/say/bot/again")
+        time.sleep(window)
+        by_name = {r["room"]: r for r in client.get("/rooms?format=json").json()["rooms"]}
+        assert by_name["first"]["last_seq"] == 2, "the message must land within the window"
 
-    client.get("/r/second/say/bot/hi")
-    body = client.get("/rooms").text
-    assert "second" in body, "a room created a moment ago must appear in /rooms"
 
-    # A message in an existing room moves it up the recency order and bumps its seq, which
-    # is just as much a change to this view as a new room is.
-    client.get("/r/first/say/bot/again")
-    assert "seq 2" in client.get("/rooms").text
+def test_a_room_created_during_a_rooms_walk_is_listed_once_the_create_returns(
+    client, tmp_path, monkeypatch
+):
+    """The ordering `_rooms_stamp` is written for, driven rather than argued.
+
+    A /rooms request that lands while a create is between its read and its lock walks the
+    pre-create state, and nothing invalidates that entry afterwards — the write path holds
+    no cache clear, and would run before the store write even if it did. The stamp is the
+    whole guarantee: rooms_created is bumped *after* the room is on disk, so the poisoned
+    entry was cached under the older stamp and the next request rejects it instead of
+    serving pre-create state for the rest of the window.
+    """
+    import config
+    import store
+
+    with config.override(ROOMS_CACHE_SECONDS=60):
+        client.get("/r/first/say/bot/hi")
+        client.get("/rooms")  # an entry to poison
+        raced = _race_before_lock(
+            monkeypatch,
+            store,
+            store.room_path(tmp_path, "racer"),
+            lambda: client.get("/rooms"),  # walks and caches while `racer` is not on disk yet
+        )
+        client.get("/r/racer/say/bot/hi")
+
+        assert raced, "the race never happened — this test proved nothing"
+        assert "racer" in client.get("/rooms").text
 
 
 def test_rooms_cache_can_be_disabled_and_never_grows_past_its_bound(client, monkeypatch):
@@ -125,16 +240,119 @@ def test_rooms_cache_can_be_disabled_and_never_grows_past_its_bound(client, monk
 
     monkeypatch.setattr(app_module.store, "room_stats", counted)
     with config.override(ROOMS_CACHE_SECONDS=0):
-        app_module._rooms_cache.clear()
+        app_module._rooms_walk.cache_clear()
         client.get("/rooms?limit=7")
         client.get("/rooms?limit=7")
-        assert calls == [7, 7] and app_module._rooms_cache == {}
+        assert calls == [7, 7] and app_module._rooms_walk.cache_info().currsize == 0
+        # Zero is also the exactness escape hatch, now that message recency is otherwise
+        # bounded by the clock rather than by the stamp: with the cache off, a message is
+        # on the very next listing rather than up to ROOMS_CACHE_SECONDS later.
+        client.get("/r/first/say/bot/hi")
+        client.get("/r/first/say/bot/again")
+        listed = {r["room"]: r for r in client.get("/rooms?format=json").json()["rooms"]}
+        assert listed["first"]["last_seq"] == 2
 
     with config.override(ROOMS_CACHE_SECONDS=60):
-        monkeypatch.setattr(app_module, "MAX_ROOMS_CACHE", 2)
-        for limit in (1, 2, 3):
+        # The bound is the LRU's maxsize, fixed when the cache is built, so the flood is the
+        # real one rather than a shrunk stand-in: every distinct `limit` is a walk that
+        # wants an entry, and eight more of them than the cache can ever hold.
+        app_module._rooms_walk.cache_clear()
+        for limit in range(1, app_module.MAX_ROOMS_CACHE + 9):
             client.get(f"/rooms?limit={limit}")
-        assert list(app_module._rooms_cache) == [2, 3]
+        assert app_module._rooms_walk.cache_info().currsize == app_module.MAX_ROOMS_CACHE
+
+
+def test_a_lost_counter_bump_costs_one_window_and_not_the_listing(client, monkeypatch):
+    """The clock is the backstop when the stamp lies.
+
+    `store._bump` is best effort on purpose — an unwritable `.counters` must not fail a
+    write that already landed — so a bump can go missing and a create then moves no stamp.
+    A hit needs the stamp to match *and* the window to be the one the entry is keyed under,
+    so the cost of that is one window, not a listing that is wrong until the next structural
+    write.
+    """
+    import config
+    import store
+
+    monkeypatch.setattr(store, "_bump", lambda *a, **k: None)  # every counter now lies
+    window = 60  # far above anything this test spends, so only the move below expires it
+    with config.override(ROOMS_CACHE_SECONDS=window):
+        client.get("/r/first/say/bot/hi")
+        client.get("/rooms")  # populates the cache, under a stamp that will not move again
+        client.get("/r/second/say/bot/hi")
+        assert "second" not in client.get("/rooms").text, "the cost: the stamp did not move"
+
+        # Move the clock into the next window rather than sleeping out a short one. The
+        # claim is that the clock releases it, and the clock is the one thing a loaded CI
+        # runner will not hold still for: a 0.25s window is a test that passes locally and
+        # fails on a runner that spends it before the assertion. The window is key material
+        # now (store._time_bucket), so the next one is simply a key the entry is not under —
+        # and the fixture pins the buckets, so bucket 1 is exactly one window on.
+        monkeypatch.setattr(store, "_time_bucket", lambda now, ttl: 1)
+        assert "second" in client.get("/rooms").text, "the clock must expire it regardless"
+
+
+def test_a_cached_view_is_never_served_under_a_different_root(client, tmp_path):
+    """The entries are keyed by `limit` alone, so ROOT is in the stamp — exactly as it is in
+    the note gauge's. Production never moves ROOT, but a reconfigured reload and this very
+    fixture do, and a view walked under one store must not be answered from another.
+    """
+    import config
+
+    with config.override(ROOMS_CACHE_SECONDS=60):
+        client.get("/r/first/say/bot/hi")
+        assert "first" in client.get("/rooms").text  # populates the cache
+
+        other = tmp_path / "elsewhere"
+        with config.override(ROOT=other):
+            client.get("/r/other/say/bot/hi")
+            body = client.get("/rooms").text
+            # `/r/first`, not `first`: the head line ends "newest first"
+            assert "/r/other" in body and "/r/first" not in body
+
+        assert "/r/first" in client.get("/rooms").text  # and the first root still answers
+
+
+def test_a_used_entry_is_the_newest_and_the_coldest_is_what_leaves(client, monkeypatch):
+    """The eviction path, which entries outliving a write made reachable: a caller cycling
+    `?limit=` keeps the cache full, so the evictor runs while other requests are still
+    walking. Nothing in that path promotes an entry after finding it any more — the key
+    already carries everything that decides whether the entry is current, and the ordering
+    is the LRU's own bookkeeping — so there is no window between a hit and a promotion for
+    an eviction to land in, which is what used to make this reachable path a 500.
+
+    The policy that replaces it is the stricter one, and the change is deliberate: ordering
+    is by last *use*, where the hand-rolled memo ordered by last walk and a request served
+    from the cache did not reinsert. A cycling caller could push out a `limit` it was
+    hitting on every single request; it cannot now. Asserted so it stays the policy.
+    """
+    import app as app_module
+    import config
+    import store
+
+    walked = []
+    real = store.room_stats
+    monkeypatch.setattr(
+        store, "room_stats", lambda *a, **k: (walked.append(k["limit"]), real(*a, **k))[1]
+    )
+    client.get("/r/first/say/bot/hi")
+    with config.override(ROOMS_CACHE_SECONDS=60):
+        # _rooms_view rather than the route: this needs more distinct limits than the read
+        # budget of one IP allows requests, and the cache sits under the route, not in it.
+        app_module._rooms_walk.cache_clear()
+        bound = app_module.MAX_ROOMS_CACHE
+        app_module._rooms_view(1)
+        for other in range(2, bound + 1):
+            app_module._rooms_view(other)
+            app_module._rooms_view(1)  # served from the cache, and that is what keeps it
+        assert app_module._rooms_walk.cache_info().currsize == bound, "full, and no fuller"
+        walked.clear()
+        for other in range(bound + 1, bound + 9):
+            app_module._rooms_view(other)  # eight entries in, eight of the coldest out
+        app_module._rooms_view(1)
+        assert 1 not in walked, "the one entry every cycle touched must not be the victim"
+        app_module._rooms_view(2)
+        assert 2 in walked, "and the coldest of them is what left"
 
 
 def test_rooms_overview_carries_stats_newest_first(client, tmp_path):
@@ -378,7 +596,7 @@ def test_one_reply_is_one_cache_entry_however_the_limit_was_spelled(client, monk
         walks += 1
         return real(*a, **k)
 
-    app._rooms_cache.clear()
+    app._rooms_walk.cache_clear()
     monkeypatch.setattr(store, "room_stats", counting)
     bodies = [client.get(f"/rooms?limit={n}").text for n in (200, 1000000, 1000001, 0, 1)]
     assert walks == 2, f"two distinct replies (>=200 and 1), {walks} walks"
@@ -601,6 +819,31 @@ def test_a_room_with_messages_can_no_longer_be_claimed(client):
     assert client.get("/r/d-busy/say/bob/still%20here").status_code == 200
 
 
+def test_a_reaped_room_is_claimable_although_its_floor_is_retained(client):
+    """`last_seq` reports a reaped room's retained floor (#139), not its content, so the
+    first-claim gate refused a claim on a room that every read showed empty. The floor is a
+    cursor: it keeps a stale `since` from starving after a recreate, and it is not a message.
+    A live file is what makes a room unclaimable, and it is checked as a file, so a torn or
+    malformed one still fails closed."""
+    import config
+    import store
+
+    did, sign = _keypair(24)
+    assert client.get("/r/d-reaped/say/alice/hello").status_code == 200
+    _age(store.room_path(config.ROOT, "d-reaped"), store.IDLE_SECONDS + 60)
+    (config.ROOT / ".reaped").unlink(missing_ok=True)
+    store._reap(config.ROOT)
+    floor = store.last_seq(config.ROOT, "d-reaped")
+    assert floor > 0, "premise: the reaped room kept its floor"
+    assert client.get("/r/d-reaped?format=json").json()["count"] == 0, "premise: empty"
+
+    r = _claim(client, "d-reaped", did, sign)
+    assert r.status_code == 200, r.text
+    assert _say_signed(client, "d-reaped", did, sign, "mine now").status_code == 200
+    # The floor still does its job: the recreated conversation resumes above it.
+    assert client.get("/r/d-reaped?format=json").json()["last_seq"] > floor
+
+
 def test_a_nickname_cannot_own_a_room(client):
     r = client.get("/kv/room-owners/d-bounty/set/alice?if_absent=1")
     assert r.status_code == 400 and "did:key" in r.text
@@ -684,6 +927,85 @@ def test_an_allow_list_needs_an_owner_and_fails_closed_on_junk(client):
     assert client.get("/kv/room-allow/d-orphan").status_code == 404
 
 
+def test_a_first_claim_does_not_inherit_an_allow_list_left_by_a_reaped_owner(client):
+    """The reaper retires an owner note on its own clock, and an allow-list written after it
+    outlives it. Unowned, the room's name is claimable again — and the list used to come with
+    it: the planted key could post in the new owner's room, and once that room was live the
+    reaper never took the list away. A claim with no current owner starts with no list."""
+    import config
+    import store
+
+    squatter, squatter_sign = _keypair(21)
+    planted, planted_sign = _keypair(22)
+    victim, victim_sign = _keypair(23)
+    assert _claim(client, "d-bait", squatter, squatter_sign).status_code == 200
+    planting = _set_signed(client, "room-allow", "d-bait", squatter, squatter_sign, planted, 2)
+    assert planting.status_code == 200
+
+    _age(store.note_path(config.ROOT, store.OWNERS_NS, "d-bait"), store.IDLE_SECONDS + 60)
+    (config.ROOT / ".reaped").unlink(missing_ok=True)
+    store._reap(config.ROOT)
+    assert client.get("/kv/room-owners/d-bait").status_code == 404, "premise: owner reaped"
+    assert client.get("/kv/room-allow/d-bait").status_code == 200, "premise: list outlived it"
+
+    # The room's nonce counter survives, so the next claim counts on from it.
+    assert _claim(client, "d-bait", victim, victim_sign, nonce=3).status_code == 200
+    assert client.get("/kv/room-allow/d-bait").text.strip().endswith("none"), "list emptied"
+    assert _say_signed(client, "d-bait", planted, planted_sign, "let me in").status_code == 403
+    assert _say_signed(client, "d-bait", victim, victim_sign, "mine").status_code == 200
+
+
+def test_a_full_allow_namespace_still_takes_the_new_owners_list(client, monkeypatch):
+    """Emptying the stale list must leave its slot to the new owner. Unlinking it left the
+    namespace's cached count one high, so at a full `room-allow` the owner's own list was a
+    create refused as over the cap until the next reap — up to REAP_EVERY away."""
+    import config
+    import store
+
+    squatter, squatter_sign = _keypair(27)
+    planted, _ = _keypair(28)
+    victim, victim_sign = _keypair(29)
+    friend, _ = _keypair(30)
+    assert _claim(client, "d-full", squatter, squatter_sign).status_code == 200
+    planting = _set_signed(client, "room-allow", "d-full", squatter, squatter_sign, planted, 2)
+    assert planting.status_code == 200
+    _age(store.note_path(config.ROOT, store.OWNERS_NS, "d-full"), store.IDLE_SECONDS + 60)
+    (config.ROOT / ".reaped").unlink(missing_ok=True)
+    store._reap(config.ROOT)  # retires the owner and re-counts, as in production
+    monkeypatch.setattr(store, "MAX_NOTES_PER_NS", 1)  # room-allow now holds exactly its cap
+
+    assert _claim(client, "d-full", victim, victim_sign, nonce=3).status_code == 200
+    mine = _set_signed(client, "room-allow", "d-full", victim, victim_sign, friend, 4)
+    assert mine.status_code == 200, mine.text
+    assert _say_signed(client, "d-full", planted, _keypair(28)[1], "still here?").status_code == 403
+
+
+def test_a_claimant_that_read_no_owner_cannot_unlink_the_winners_allow_list(client, monkeypatch):
+    """The clean-up above must not reach state created after its own observation. Two first
+    claims can both read "no owner"; if the one that loses then drops the allow-list, it
+    drops the list the winner has since published. Replayed here: the winner has claimed and
+    published, and the gate runs as the other claimant saw the room — unowned."""
+    import app as app_module
+    import store
+
+    winner, winner_sign = _keypair(24)
+    friend, _ = _keypair(25)
+    loser, _ = _keypair(26)
+    assert _claim(client, "d-race", winner, winner_sign).status_code == 200
+    listed = _set_signed(client, "room-allow", "d-race", winner, winner_sign, friend, 2)
+    assert listed.status_code == 200
+
+    real = store.note_get
+    monkeypatch.setattr(
+        store,
+        "note_get",
+        lambda root, ns, key: None if ns == store.OWNERS_NS else real(root, ns, key),
+    )
+    assert app_module._note_write_gate(store.OWNERS_NS, "d-race", loser, loser) is None
+    monkeypatch.setattr(store, "note_get", real)
+    assert friend in client.get("/kv/room-allow/d-race").text, "the winner's list survives"
+
+
 def test_signed_note_writes_are_scoped_to_the_two_ownership_namespaces(client):
     did, sign = _keypair()
     r = _set_signed(client, "plans", "next", did, sign, "ship")
@@ -748,6 +1070,35 @@ def test_signed_note_get_covers_the_swept_value(client):
         == 403
     )
     assert client.get(f"/kv/room-nonce/{room}").text.strip().endswith("2")
+
+
+def test_invalid_signed_note_conditions_do_not_burn_a_nonce(client):
+    """A rejected condition must leave the signed write retryable on both lanes."""
+    owner, owner_sign = _keypair()
+    room = "d-condition-get"
+    assert _claim(client, room, owner, owner_sign).status_code == 200
+
+    value, _ = _keypair(seed=3)
+    signature = owner_sign(f"room-allow|{room}|2|{value}")
+    base = f"/kv/room-allow/{room}/set-signed/{owner}/{signature}/2/{value}"
+    invalid = client.get(f"{base}?if_absent=maybe")
+    assert invalid.status_code == 400 and "if_absent" in invalid.text
+    assert client.get(f"/kv/room-nonce/{room}").text.strip().endswith("1")
+    assert client.get(f"{base}?if_absent=1").status_code == 200
+    assert client.get(f"/kv/room-nonce/{room}").text.strip().endswith("2")
+
+    post_owner, post_sign = _keypair(seed=2)
+    post_room = "d-condition-post"
+    assert _claim(client, post_room, post_owner, post_sign).status_code == 200
+    payload = _signed_note_payload(
+        "room-allow", post_room, post_owner, post_sign, value, nonce=2, if_absent="maybe"
+    )
+    invalid = client.post(f"/kv/room-allow/{post_room}", json=payload)
+    assert invalid.status_code == 400 and "if_absent" in invalid.text
+    assert client.get(f"/kv/room-nonce/{post_room}").text.strip().endswith("1")
+    payload["if_absent"] = True
+    assert client.post(f"/kv/room-allow/{post_room}", json=payload).status_code == 200
+    assert client.get(f"/kv/room-nonce/{post_room}").text.strip().endswith("2")
 
 
 def test_a_replayed_ownership_url_cannot_roll_an_allow_list_back(client):
@@ -940,3 +1291,51 @@ def test_polled_reads_are_edge_cacheable_and_held_or_write_replies_never_are(cli
     with config.override(EDGE_CACHE_SECONDS=0):
         assert client.get("/rooms").headers["cache-control"] == "no-store"
         assert client.get("/r/lobby").headers["cache-control"] == "no-store"
+
+
+def test_wait_wakes_on_a_write_from_another_process(client, tmp_path):
+    """`?wait=` carries across processes, which is what makes it work under `--workers N`.
+
+    The wait loop re-reads the room *file*, so the writer needs no shared memory with the
+    waiter — no event registry, no wakeup bus, nothing that a process boundary could
+    isolate. This spawns a real second interpreter against the same CHAT_ROOT and holds a
+    long-poll here while it writes, which is the arrangement uvicorn's workers are in.
+
+    Written down as a test because the absence of a `_waiters[room]` event table reads as
+    a missing feature: the report it guards against is "multi-worker long-polls never
+    wake", and they always did — the process boundary costs one CHAT_WAIT_POLL of latency
+    and nothing else.
+    """
+    import subprocess
+    import sys
+    import threading
+
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    client.get("/r/xw/say/seed/first")
+    seq = client.get("/r/xw?format=json").json()["messages"][-1]["seq"]
+
+    other = (
+        f"import sys; sys.path.insert(0, {src!r}); "
+        "import config, store; from pathlib import Path; "
+        f"store.append(Path({str(tmp_path)!r}), 'xw', 'otherworker', 'from another process')"
+    )
+    done = threading.Event()
+
+    def write_from_another_process():
+        # Long enough that the waiter is parked in its sleep, short enough to stay well
+        # inside the wait budget below.
+        time.sleep(0.3)
+        run = subprocess.run([sys.executable, "-c", other], capture_output=True, text=True)
+        assert run.returncode == 0, run.stderr
+        done.set()
+
+    writer = threading.Thread(target=write_from_another_process)
+    writer.start()
+    try:
+        held = client.get(f"/r/xw?format=json&since={seq}&wait=5")
+    finally:
+        writer.join()
+    assert done.is_set()
+    messages = held.json()["messages"]
+    assert [m["text"] for m in messages] == ["from another process"]
+    assert messages[0]["from"] == "otherworker"
